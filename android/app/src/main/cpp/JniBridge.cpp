@@ -189,6 +189,13 @@ static void audioPump(EngineSimHandle* h) {
     // Backfire / popcorn
     uint32_t popcornSeed = 99999;
 
+    // Cabin filter state
+    float cabinLowShelf = 0.0f;   // ~200Hz low shelf
+    float cabinHighShelf = 0.0f;  // ~2kHz high shelf
+    static const int CABIN_REVERB_LEN = 256;  // ~5.8ms at 44.1kHz
+    float cabinReverbBuf[CABIN_REVERB_LEN] = {0};
+    int cabinReverbPos = 0;
+
     // Noise helper
     auto nextNoise = [&]() -> float {
         rngState = rngState * 1103515245u + 12345u;
@@ -466,6 +473,25 @@ static void audioPump(EngineSimHandle* h) {
                 // INT16 hard clipping (engine-sim style)
                 if (output > 1.0f) output = 1.0f;
                 else if (output < -1.0f) output = -1.0f;
+
+                // === 11. Cabin filter layer (car interior effect - AGGRESSIVE) ===
+                // A. Low shelf boost: ~200Hz, +12dB
+                cabinLowShelf = 0.995f * cabinLowShelf + 0.005f * output;
+                output = output + 3.0f * (cabinLowShelf - output);
+
+                // B. High shelf cut: ~1kHz, -8dB (more aggressive)
+                cabinHighShelf = 0.90f * cabinHighShelf + 0.10f * output;
+                output = 0.4f * output + 0.6f * cabinHighShelf;
+
+                // C. Reverb: 8ms, 25% wet (stronger)
+                cabinReverbBuf[cabinReverbPos] = output;
+                cabinReverbPos = (cabinReverbPos + 1) % CABIN_REVERB_LEN;
+                float reverb = 0.0f;
+                for (int r = 0; r < CABIN_REVERB_LEN; r++) {
+                    reverb += cabinReverbBuf[(cabinReverbPos + r) % CABIN_REVERB_LEN];
+                }
+                reverb /= CABIN_REVERB_LEN;
+                output = 0.75f * output + 0.25f * reverb;
 
                 // Clamp and convert
                 if (output > 1.0f) output = 1.0f;
