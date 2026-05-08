@@ -324,18 +324,29 @@ static void audioPump(EngineSimHandle* h) {
                 double throttleDelta = h->prevSmoothThrottle - smoothThrottle;
                 h->prevSmoothThrottle = smoothThrottle;
 
-                if (throttleDelta > 0.2 && smoothRpm > 3000.0) {
-                    int prob = std::min(80, (int)(smoothRpm / 100));
-                    if (h->cylinderCount >= 8) prob = std::min(99, (int)(prob * 1.5));
+                // More frequent: lower threshold, lower RPM gate, more slots
+                if (throttleDelta > 0.05 && smoothRpm > 1500.0) {
+                    int prob = std::min(90, (int)(smoothRpm / 50));
+                    if (h->cylinderCount >= 6) prob = std::min(99, (int)(prob * 1.3));
+                    if (h->cylinderCount >= 8) prob = std::min(99, (int)(prob * 1.2));
                     popcornSeed = popcornSeed * 1103515245u + 12345u;
                     if (((popcornSeed >> 16) & 0xffff) % 100 < prob) {
                         for (int p = 0; p < 4; p++) {
                             if (!h->popcornEvents[p].active) {
                                 h->popcornEvents[p].active = true;
                                 h->popcornEvents[p].position = 0;
-                                h->popcornEvents[p].length = 300 + (rand() % 400);
-                                h->popcornEvents[p].amplitude = 0.5 + smoothThrottle * 0.7;
-                                h->popcornEvents[p].baseFreq = 60 + (rand() % 80);
+                                h->popcornEvents[p].length = 200 + (rand() % 500);  // shorter to longer range
+                                h->popcornEvents[p].amplitude = 0.6 + smoothThrottle * 0.8;
+                                // Vary tone: low rumble or sharp crack
+                                if (rand() % 3 == 0) {
+                                    // Sharp crack (backfire)
+                                    h->popcornEvents[p].baseFreq = 120 + (rand() % 100);
+                                    h->popcornEvents[p].length = 100 + (rand() % 200);
+                                    h->popcornEvents[p].amplitude *= 1.5f;
+                                } else {
+                                    // Popcorn burble
+                                    h->popcornEvents[p].baseFreq = 40 + (rand() % 80);
+                                }
                                 h->popcornEvents[p].prevFiltered = 0;
                                 break;
                             }
@@ -346,15 +357,15 @@ static void audioPump(EngineSimHandle* h) {
                 for (int p = 0; p < 4; p++) {
                     if (h->popcornEvents[p].active) {
                         double t = (double)h->popcornEvents[p].position / h->popcornEvents[p].length;
-                        double envelope = std::exp(-t * 2.0);
-                        double freq = h->popcornEvents[p].baseFreq * (1.0 - 0.3 * t);
+                        double envelope = std::exp(-t * 4.0);  // faster decay
+                        double freq = h->popcornEvents[p].baseFreq * (1.0 - 0.5 * t);  // more pitch drop
                         double tSec = (double)h->popcornEvents[p].position / 44100.0;
                         double sine = sin(2.0 * M_PI * freq * tSec);
                         popcornSeed = popcornSeed * 1103515245u + 12345u;
                         double pnoise = (double)((popcornSeed >> 16) & 0x7fff) / 16383.5 - 1.0;
                         double popSample = (sine * 0.8 + pnoise * 0.2) * envelope * h->popcornEvents[p].amplitude;
                         double dt = 1.0 / 44100.0;
-                        double rc = 1.0 / (2.0 * M_PI * 400.0);
+                        double rc = 1.0 / (2.0 * M_PI * 250.0);  // lower cutoff = more rumble
                         double alpha = dt / (rc + dt);
                         double filtered = h->popcornEvents[p].prevFiltered + alpha * (popSample - h->popcornEvents[p].prevFiltered);
                         h->popcornEvents[p].prevFiltered = filtered;
