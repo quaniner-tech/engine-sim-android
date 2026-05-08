@@ -228,43 +228,57 @@ static void audioPump(EngineSimHandle* h) {
                 prevDc = prevDc + 0.99f * (f_in - prevDc);
                 float f_ac = f_in - prevDc;  // AC component
 
-                // === 4. Derivative (transient emphasis) ===
+                // === 4. Derivative (transient emphasis) - 강화된 둥둥둥 베이스 ===
                 float f_deriv = (f_in - prevSample) * (float)sr;
                 prevSample = f_in;
+                
+                // RPM-based bass boost for realistic engine thump
+                float bassBoost = 1.0f;
+                if (rpm < 2000.0f) {
+                    // Strong bass at low RPM (툭툭툭)
+                    bassBoost = 2.0f + 1.0f * (rpm / 2000.0f);  // 2.0x to 3.0x
+                    f_deriv *= bassBoost;
+                } else if (rpm < 4000.0f) {
+                    // Gradual reduction in mid RPM
+                    float midRpmFactor = (rpm - 2000.0f) / 2000.0f;  // 0 to 1
+                    bassBoost = 3.0f - 2.0f * midRpmFactor;  // 3.0x to 1.0x
+                    f_deriv *= bassBoost;
+                }
+                // High RPM: natural bass (no extra boost)
 
                 // === 5. Air noise channel ===
                 float noise = nextNoise();
                 float noiseAlpha = 0.02f;  // lowpass cutoff ~100Hz at 44.1kHz
                 prevFilteredNoise = prevFilteredNoise + noiseAlpha * (noise - prevFilteredNoise);
-                float noiseMixed = 0.5f * prevFilteredNoise + 0.5f;
+                // noiseMix variable removed - using engine-sim style airNoise parameter
 
                 // === 6. v_in synthesis with RPM-based noise reduction ===
                 
                 // Adjust noise mixing based on RPM
                 float noiseMix = 0.99f;  // Default high noise mix
-                float engineMix = 0.01f;  // Default low engine mix
+                // Engine-sim style: airNoise & dF_F_mix parameters
+                float airNoise = 1.0f;      // Air noise amount (0-1)
+                float dF_F_mix = 0.01f;     // Engine vs noise mix (0-1)
                 
-                // At low RPM: reduce noise, emphasize engine sound (툭툭툭)
+                // RPM-based dynamic adjustment for better engine sound
                 if (rpm < 1500.0f) {
+                    // Low RPM: minimal noise, strong engine thump
                     float lowRpmFactor = rpm / 1500.0f;  // 0 to 1
-                    noiseMix = 0.70f + 0.29f * lowRpmFactor;  // 0.70 to 0.99
-                    engineMix = 0.30f - 0.29f * lowRpmFactor;  // 0.30 to 0.01
-                }
-                
-                // At medium RPM: balanced mix
-                else if (rpm < 3000.0f) {
+                    airNoise = 0.2f + 0.3f * lowRpmFactor;   // 0.2 to 0.5 (low noise)
+                    dF_F_mix = 0.4f - 0.39f * lowRpmFactor;  // 0.4 to 0.01 (strong engine)
+                } else if (rpm < 3000.0f) {
+                    // Medium RPM: balanced mix
                     float medRpmFactor = (rpm - 1500.0f) / 1500.0f;  // 0 to 1
-                    noiseMix = 0.85f + 0.14f * medRpmFactor;  // 0.85 to 0.99
-                    engineMix = 0.15f - 0.14f * medRpmFactor;  // 0.15 to 0.01
+                    airNoise = 0.5f + 0.4f * medRpmFactor;   // 0.5 to 0.9 (increasing noise)
+                    dF_F_mix = 0.01f + 0.14f * medRpmFactor;  // 0.01 to 0.15 (less engine focus)
+                } else {
+                    // High RPM: more realistic noise, less engine focus
+                    airNoise = 0.9f + 0.1f;               // 1.0 (full noise for realism)
+                    dF_F_mix = 0.15f;                     // Fixed low engine mix
                 }
                 
-                // At high RPM: more noise for realism
-                else {
-                    noiseMix = 0.99f;
-                    engineMix = 0.01f;
-                }
-                
-                float v_in = f_deriv * engineMix + f_ac * noiseMixed * noiseMix;
+                // Engine-sim style signal processing (f_p = derivative, f = AC component)
+                float v_in = f_deriv * dF_F_mix + f_ac * (1.0f - dF_F_mix);
 
                 // === 7. Backfire / popcorn ===
                 double throttleDelta = h->prevSmoothThrottle - smoothThrottle;
