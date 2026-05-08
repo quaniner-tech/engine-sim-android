@@ -1,0 +1,35 @@
+{
+  "name": "Inline-4",
+  "description": "4-cylinder inline engine - common in compact cars",
+  "cylinder_count": 4,
+  "bank_count": 1,
+  "configuration": "inline",
+  "bore_mm": 86.0,
+  "stroke_mm": 86.0,
+  "compression_ratio": 10.5,
+  "displacement_cc": 1596,
+  "max_rpm": 7000,
+  "redline_rpm": 6500,
+  "fuel_type": "gasoline",
+  "cylinder_head": {
+    "type": "dual_overhead_cam",
+    "valves_per_cylinder": 4,
+    "intake_runner_length_mm": 150,
+    "exhaust_runner_length_mm": 120
+  },
+  "intake": {
+    "type": "naturally_aspirated",
+    "runner_count": 1,
+    "plenum_volume_cc": 800
+  },
+  "exhaust": {
+    "type": "4_into.1",
+    "primary_pipe_diameter_mm": 38,
+    "collector_diameter_mm": 51
+  },
+  "ignition": {
+    "type": "electronic",
+    "timing_advance_degrees": 10
+  },
+  "characteristic": "Smooth at high RPM, muted exhaust note"
+}

@@ -1,0 +1,604 @@
+#include "JniBridge.h"
+
+#include <android/log.h>
+#include <android/asset_manager.h>
+#include <android/asset_manager_jni.h>
+#include <cstring>
+#include <memory>
+#include <cmath>
+#include <thread>
+#include <vector>
+
+#define LOG_TAG "JniBridge"
+#define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
+#define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
+
+#include "engine_sim/engine.h"
+#include "engine_sim/vehicle.h"
+#include "engine_sim/transmission.h"
+#include "aaudio_engine.h"
+
+struct ImpulseLayer {
+    std::vector<float> data;
+    float volume = 0.0f;
+};
+
+struct PopcornEvent {
+    bool active = false;
+    int position = 0;
+    int length = 0;
+    double amplitude = 0;
+    double baseFreq = 0;
+    double prevFiltered = 0;
+};
+
+struct EngineSimHandle {
+    std::unique_ptr<Engine> engine;
+    std::unique_ptr<Vehicle> vehicle;
+    std::unique_ptr<Transmission> transmission;
+    std::unique_ptr<AAudioEngine> audioEngine;
+
+    float currentRpm = 800.0f;
+    float currentTorque = 0.0f;
+    float currentPower = 0.0f;
+    float currentThrottle = 0.0f;
+    float volume = 1.0f;
+    bool isRunning = false;
+    int sampleRate = 44100;
+    int cylinderCount = 4;
+
+    // Audio pump thread
+    std::thread* audioPumpThread = nullptr;
+    std::atomic<bool> audioPumpRunning{false};
+
+    // Multi-layer impulse responses (6 slots)
+    static const int MAX_IR_LAYERS = 6;
+    ImpulseLayer irLayers[MAX_IR_LAYERS];
+    int activeIrCount = 0;
+
+    // Preset name for IR selection
+    std::string currentPreset;
+
+    // Backfire / popcorn state
+    PopcornEvent popcornEvents[4];
+    double prevSmoothThrottle = 0.0;
+};
+
+// --- Load WAV file from Android assets ---
+static bool loadWavFromAssets(AAssetManager* assetMgr, const char* path,
+                               std::vector<float>& pcmFloat) {
+    AAsset* asset = AAssetManager_open(assetMgr, path, AASSET_MODE_STREAMING);
+    if (!asset) {
+        LOGE("Failed to open asset: %s", path);
+        return false;
+    }
+
+    off_t fileSize = AAsset_getLength(asset);
+    if (fileSize < 44) {
+        LOGE("WAV file too small: %s (%ld bytes)", path, (long)fileSize);
+        AAsset_close(asset);
+        return false;
+    }
+
+    std::vector<uint8_t> raw(fileSize);
+    AAsset_read(asset, raw.data(), fileSize);
+    AAsset_close(asset);
+
+    if (raw[0] != 'R' || raw[1] != 'I' || raw[2] != 'F' || raw[3] != 'F') {
+        LOGE("Not a RIFF file: %s", path);
+        return false;
+    }
+
+    uint32_t dataOffset = 0;
+    uint32_t dataSize = 0;
+    for (uint32_t i = 12; i < fileSize - 8; i++) {
+        if (raw[i] == 'd' && raw[i+1] == 'a' && raw[i+2] == 't' && raw[i+3] == 'a') {
+            dataOffset = i + 8;
+            dataSize = *(uint32_t*)&raw[i + 4];
+            break;
+        }
+    }
+
+    if (dataOffset == 0 || dataSize == 0) {
+        LOGE("No data chunk found in: %s", path);
+        return false;
+    }
+
+    uint32_t sampleCount = dataSize / sizeof(int16_t);
+    int16_t* pcm16 = (int16_t*)(raw.data() + dataOffset);
+
+    // Convert to float [-1, 1] and truncate to IR_MAX_LENGTH
+    int irLen = std::min((int)sampleCount, 2048);
+    pcmFloat.resize(irLen);
+    float maxVal = 0.0f;
+    for (int i = 0; i < irLen; i++) {
+        pcmFloat[i] = pcm16[i] / 32768.0f;
+        float abs = std::fabs(pcmFloat[i]);
+        if (abs > maxVal) maxVal = abs;
+    }
+    // Normalize
+    if (maxVal > 0.001f) {
+        for (int i = 0; i < irLen; i++) {
+            pcmFloat[i] /= maxVal;
+        }
+    }
+
+    LOGI("Loaded IR WAV: %s — %d samples (truncated from %u)", path, irLen, sampleCount);
+    return true;
+}
+
+// --- Audio pump: direct synthesis + multi-layer FIR convolution ---
+static void audioPump(EngineSimHandle* h) {
+    LOGI("Audio pump started (engine-sim pipeline, %d cylinders, %d layers)",
+         h->cylinderCount, h->activeIrCount);
+
+    const int chunkSize = 256;
+    int16_t* audioBuffer = new int16_t[chunkSize];
+
+    // Find max IR length across active layers
+    int maxIrLen = 0;
+    for (int l = 0; l < EngineSimHandle::MAX_IR_LAYERS; l++) {
+        if (h->irLayers[l].volume > 0.0f && (int)h->irLayers[l].data.size() > maxIrLen)
+            maxIrLen = (int)h->irLayers[l].data.size();
+    }
+    if (maxIrLen == 0) maxIrLen = 1;
+
+    int historyLen = maxIrLen + chunkSize;
+    std::vector<float> history(historyLen, 0.0f);
+    int histWritePos = 0;
+    int writeCount = 0;
+
+    double crankAngle = 0.0;
+    const double cycleRad = 4.0 * M_PI;  // 720 degrees
+
+    // Smoothing state
+    double smoothRpm = 800.0;
+    double smoothThrottle = 0.0;
+
+    // Engine-sim pipeline state
+    float prevSample = 0.0f;       // for derivative
+    float prevDc = 0.0f;           // DC filter state
+    float prevFilteredNoise = 0.0f;// air noise LPF state
+    float prevAntiAlias = 0.0f;    // anti-aliasing LPF state
+    float rmsAccum = 0.001f;       // leveling filter RMS
+    uint32_t rngState = 54321;
+
+    // Backfire / popcorn
+    uint32_t popcornSeed = 99999;
+
+    // Noise helper
+    auto nextNoise = [&]() -> float {
+        rngState = rngState * 1103515245u + 12345u;
+        return ((rngState >> 16) & 0x7fff) / 16383.5f - 1.0f;
+    };
+
+    while (h->audioPumpRunning.load()) {
+        if (h->isRunning && h->audioEngine && h->audioEngine->isActive()) {
+            double sr = h->sampleRate;
+
+            for (int i = 0; i < chunkSize; i++) {
+                // Smooth RPM and throttle
+                double targetRpm = h->currentRpm;
+                double targetThrottle = h->currentThrottle;
+                smoothRpm += (targetRpm - smoothRpm) * 0.005;
+                smoothThrottle += (targetThrottle - smoothThrottle) * 0.01;
+
+                double crankRadPerSample = (smoothRpm / 60.0) * 2.0 * M_PI / sr;
+
+                // === 1. Generate exhaust flow (physical model) ===
+                float exhaustFlow = 0.0f;
+                float throttle = (float)smoothThrottle;
+
+                for (int c = 0; c < h->cylinderCount; c++) {
+                    double cylOffset = (720.0 / h->cylinderCount) * c;
+                    double crankDeg = std::fmod(crankAngle * 180.0 / M_PI, 720.0);
+                    if (crankDeg < 0) crankDeg += 720.0;
+                    double cylDeg = crankDeg - cylOffset;
+                    if (cylDeg < 0) cylDeg += 720.0;
+
+                    // Exhaust valve open: ~130° to ~400° in 720° cycle
+                    if (cylDeg > 130.0 && cylDeg < 400.0) {
+                        double t = (cylDeg - 130.0) / 270.0;
+                        exhaustFlow += (float)(std::exp(-t * 3.0) * smoothThrottle);
+                    }
+                }
+
+                exhaustFlow /= (float)h->cylinderCount;
+
+                // Add idle base flow
+                exhaustFlow += 0.02f;
+
+                // === 2. Jitter filter (subtle randomness) ===
+                float jitter = nextNoise() * 0.002f;
+                float f_in = exhaustFlow + jitter;
+
+                // === 3. DC filter (1-pole highpass) ===
+                prevDc = prevDc + 0.99f * (f_in - prevDc);
+                float f_ac = f_in - prevDc;  // AC component
+
+                // === 4. Derivative (transient emphasis) ===
+                float f_deriv = (f_in - prevSample) * (float)sr;
+                prevSample = f_in;
+
+                // === 5. Air noise channel ===
+                float noise = nextNoise();
+                float noiseAlpha = 0.02f;  // lowpass cutoff ~100Hz at 44.1kHz
+                prevFilteredNoise = prevFilteredNoise + noiseAlpha * (noise - prevFilteredNoise);
+                float noiseMixed = 0.5f * prevFilteredNoise + 0.5f;
+
+                // === 6. v_in synthesis ===
+                // dF_F_mix = 0.01: 1% derivative + 99% AC * noise
+                float v_in = f_deriv * 0.01f + f_ac * noiseMixed * 0.99f;
+
+                // === 7. Backfire / popcorn ===
+                double throttleDelta = h->prevSmoothThrottle - smoothThrottle;
+                h->prevSmoothThrottle = smoothThrottle;
+
+                if (throttleDelta > 0.2 && smoothRpm > 3000.0) {
+                    int prob = std::min(80, (int)(smoothRpm / 100));
+                    if (h->cylinderCount >= 8) prob = std::min(99, (int)(prob * 1.5));
+                    popcornSeed = popcornSeed * 1103515245u + 12345u;
+                    if (((popcornSeed >> 16) & 0xffff) % 100 < prob) {
+                        for (int p = 0; p < 4; p++) {
+                            if (!h->popcornEvents[p].active) {
+                                h->popcornEvents[p].active = true;
+                                h->popcornEvents[p].position = 0;
+                                h->popcornEvents[p].length = 300 + (rand() % 400);
+                                h->popcornEvents[p].amplitude = 0.5 + smoothThrottle * 0.7;
+                                h->popcornEvents[p].baseFreq = 60 + (rand() % 80);
+                                h->popcornEvents[p].prevFiltered = 0;
+                                break;
+                            }
+                        }
+                    }
+                }
+
+                for (int p = 0; p < 4; p++) {
+                    if (h->popcornEvents[p].active) {
+                        double t = (double)h->popcornEvents[p].position / h->popcornEvents[p].length;
+                        double envelope = std::exp(-t * 2.0);
+                        double freq = h->popcornEvents[p].baseFreq * (1.0 - 0.3 * t);
+                        double tSec = (double)h->popcornEvents[p].position / 44100.0;
+                        double sine = sin(2.0 * M_PI * freq * tSec);
+                        popcornSeed = popcornSeed * 1103515245u + 12345u;
+                        double pnoise = (double)((popcornSeed >> 16) & 0x7fff) / 16383.5 - 1.0;
+                        double popSample = (sine * 0.8 + pnoise * 0.2) * envelope * h->popcornEvents[p].amplitude;
+                        double dt = 1.0 / 44100.0;
+                        double rc = 1.0 / (2.0 * M_PI * 400.0);
+                        double alpha = dt / (rc + dt);
+                        double filtered = h->popcornEvents[p].prevFiltered + alpha * (popSample - h->popcornEvents[p].prevFiltered);
+                        h->popcornEvents[p].prevFiltered = filtered;
+                        v_in += (float)filtered;
+                        h->popcornEvents[p].position++;
+                        if (h->popcornEvents[p].position >= h->popcornEvents[p].length)
+                            h->popcornEvents[p].active = false;
+                    }
+                }
+
+                // Store in history for convolution
+                history[histWritePos % historyLen] = v_in;
+                histWritePos++;
+
+                // === 8. Multi-layer FIR convolution ===
+                float convOut = 0.0f;
+                for (int l = 0; l < EngineSimHandle::MAX_IR_LAYERS; l++) {
+                    float vol = h->irLayers[l].volume;
+                    if (vol <= 0.0f) continue;
+                    int irLen = (int)h->irLayers[l].data.size();
+                    for (int j = 0; j < irLen; j++) {
+                        int idx = histWritePos - 1 - j;
+                        while (idx < 0) idx += historyLen;
+                        convOut += history[idx % historyLen] * h->irLayers[l].data[j] * vol;
+                    }
+                }
+
+                // === 9. Anti-aliasing LPF ===
+                float aaAlpha = 0.4f;
+                float antiAliased = prevAntiAlias + aaAlpha * (convOut - prevAntiAlias);
+                prevAntiAlias = antiAliased;
+
+                // === 10. Leveling filter (RMS-based AGC) ===
+                rmsAccum = std::sqrt(rmsAccum * rmsAccum * 0.999f + antiAliased * antiAliased * 0.001f);
+                float targetLevel = 0.15f;
+                float gain = std::min(2.0f, targetLevel / std::max(rmsAccum, 0.001f));
+                float output = antiAliased * gain * h->volume;
+
+                // Clamp and convert
+                if (output > 1.0f) output = 1.0f;
+                if (output < -1.0f) output = -1.0f;
+                audioBuffer[i] = (int16_t)(output * 32767.0f);
+
+                crankAngle += crankRadPerSample;
+                if (crankAngle >= cycleRad) crankAngle -= cycleRad;
+            }
+
+            h->audioEngine->writeAudio(audioBuffer, chunkSize);
+
+            writeCount++;
+            if (writeCount % 200 == 0) {
+                LOGI("audioPump: count=%d, rpm=%.0f, throttle=%.2f", writeCount, h->currentRpm, h->currentThrottle);
+            }
+        } else {
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+    }
+
+    delete[] audioBuffer;
+    LOGI("Audio pump stopped");
+}
+
+extern "C" {
+
+JNIEXPORT jlong JNICALL
+Java_com_enginesim_app_EngineSimLibrary_nativeCreate(JNIEnv* env, jobject thiz) {
+    LOGI("Creating EngineSim handle");
+
+    EngineSimHandle* handle = new EngineSimHandle();
+
+    handle->engine = std::make_unique<Engine>();
+    handle->vehicle = std::make_unique<Vehicle>();
+    handle->transmission = std::make_unique<Transmission>();
+
+    handle->currentRpm = 800.0f;
+    handle->cylinderCount = 4;
+
+    LOGI("EngineSim handle created: %p", handle);
+    return reinterpret_cast<jlong>(handle);
+}
+
+JNIEXPORT void JNICALL
+Java_com_enginesim_app_EngineSimLibrary_nativeDestroy(JNIEnv* env, jobject thiz, jlong handle) {
+    LOGI("Destroying EngineSim handle: %ld", handle);
+
+    if (handle != 0) {
+        EngineSimHandle* h = reinterpret_cast<EngineSimHandle*>(handle);
+
+        h->audioPumpRunning.store(false);
+        if (h->audioPumpThread) {
+            h->audioPumpThread->join();
+            delete h->audioPumpThread;
+            h->audioPumpThread = nullptr;
+        }
+
+        if (h->audioEngine) {
+            h->audioEngine->shutdown();
+            h->audioEngine.reset();
+        }
+
+        delete h;
+    }
+}
+
+JNIEXPORT void JNICALL
+Java_com_enginesim_app_EngineSimLibrary_nativeStart(JNIEnv* env, jobject thiz, jlong handle) {
+    if (handle == 0) return;
+
+    EngineSimHandle* h = reinterpret_cast<EngineSimHandle*>(handle);
+    h->isRunning = true;
+    LOGI("Engine started, isRunning=%d", h->isRunning);
+}
+
+JNIEXPORT void JNICALL
+Java_com_enginesim_app_EngineSimLibrary_nativeStop(JNIEnv* env, jobject thiz, jlong handle) {
+    if (handle == 0) return;
+
+    EngineSimHandle* h = reinterpret_cast<EngineSimHandle*>(handle);
+    h->isRunning = false;
+    h->currentRpm = 800.0f;
+    h->currentThrottle = 0.0f;
+    LOGI("Engine stopped");
+}
+
+JNIEXPORT void JNICALL
+Java_com_enginesim_app_EngineSimLibrary_nativeSetThrottle(JNIEnv* env, jobject thiz,
+    jlong handle, jfloat throttle) {
+
+    if (handle == 0) return;
+
+    EngineSimHandle* h = reinterpret_cast<EngineSimHandle*>(handle);
+    h->currentThrottle = throttle;
+
+    if (h->isRunning) {
+        float targetRpm = 800.0f + (throttle * 6000.0f);
+        h->currentRpm = targetRpm;
+
+        float maxTorque = 400.0f;
+        h->currentTorque = throttle * maxTorque * (1.0f - (h->currentRpm / 10000.0f));
+        if (h->currentTorque < 0) h->currentTorque = 0;
+
+        h->currentPower = (h->currentTorque * h->currentRpm) / 5252.0f;
+        if (h->currentPower < 0) h->currentPower = 0;
+    }
+}
+
+JNIEXPORT void JNICALL
+Java_com_enginesim_app_EngineSimLibrary_nativeSetVolume(JNIEnv* env, jobject thiz,
+    jlong handle, jfloat volume) {
+
+    if (handle == 0) return;
+
+    EngineSimHandle* h = reinterpret_cast<EngineSimHandle*>(handle);
+    h->volume = volume;
+
+    if (h->audioEngine) {
+        h->audioEngine->setVolume(volume);
+    }
+}
+
+JNIEXPORT jfloat JNICALL
+Java_com_enginesim_app_EngineSimLibrary_nativeGetRpm(JNIEnv* env, jobject thiz, jlong handle) {
+    if (handle == 0) return 800.0f;
+    return reinterpret_cast<EngineSimHandle*>(handle)->currentRpm;
+}
+
+JNIEXPORT jfloat JNICALL
+Java_com_enginesim_app_EngineSimLibrary_nativeGetTorque(JNIEnv* env, jobject thiz, jlong handle) {
+    if (handle == 0) return 0.0f;
+    return reinterpret_cast<EngineSimHandle*>(handle)->currentTorque;
+}
+
+JNIEXPORT jfloat JNICALL
+Java_com_enginesim_app_EngineSimLibrary_nativeGetPower(JNIEnv* env, jobject thiz, jlong handle) {
+    if (handle == 0) return 0.0f;
+    return reinterpret_cast<EngineSimHandle*>(handle)->currentPower;
+}
+
+JNIEXPORT jint JNICALL
+Java_com_enginesim_app_EngineSimLibrary_nativeReadAudio(JNIEnv* env, jobject thiz,
+    jlong handle, jshortArray buffer, jint samples) {
+    return 0;
+}
+
+JNIEXPORT jboolean JNICALL
+Java_com_enginesim_app_EngineSimLibrary_nativeSimulateStep(JNIEnv* env, jobject thiz, jlong handle) {
+    if (handle == 0) return JNI_FALSE;
+
+    EngineSimHandle* h = reinterpret_cast<EngineSimHandle*>(handle);
+
+    if (!h->isRunning) return JNI_TRUE;
+
+    float targetRpm = 800.0f + (h->currentThrottle * 5500.0f);
+    float rpmDelta = targetRpm - h->currentRpm;
+    h->currentRpm += rpmDelta * 0.03f;
+
+    if (h->currentRpm < 800.0f) h->currentRpm = 800.0f;
+    if (h->currentRpm > 8000.0f) h->currentRpm = 8000.0f;
+
+    float maxTorque = 450.0f;
+    float torqueFactor = 1.0f - (h->currentRpm / 9000.0f);
+    if (torqueFactor < 0) torqueFactor = 0;
+    h->currentTorque = h->currentThrottle * maxTorque * torqueFactor;
+
+    h->currentPower = (h->currentTorque * h->currentRpm) / 5252.0f;
+    if (h->currentPower < 0) h->currentPower = 0;
+
+    return JNI_TRUE;
+}
+
+JNIEXPORT jboolean JNICALL
+Java_com_enginesim_app_EngineSimLibrary_nativeInitializeAudio(JNIEnv* env, jobject thiz,
+    jlong handle, jint sampleRate, jint channelCount, jint bufferSizeFrames,
+    jobject assetManager) {
+
+    LOGI("Initializing audio: rate=%d, channels=%d, buffer=%d",
+         sampleRate, channelCount, bufferSizeFrames);
+
+    if (handle == 0) {
+        LOGE("Invalid handle");
+        return JNI_FALSE;
+    }
+
+    EngineSimHandle* h = reinterpret_cast<EngineSimHandle*>(handle);
+    h->sampleRate = sampleRate;
+
+    // --- Load impulse response WAV from assets ---
+    AAssetManager* mgr = AAssetManager_fromJava(env, assetManager);
+    if (!mgr) {
+        LOGE("Failed to get AAssetManager");
+        return JNI_FALSE;
+    }
+
+    // Load all IR layers
+    // Index: 0=smooth_01, 1=smooth_05, 2=smooth_27, 3=smooth_39, 4=smooth_45
+    const char* irPaths[5] = {
+        "sound-library/smooth/smooth_01.wav",
+        "sound-library/smooth/smooth_05.wav",
+        "sound-library/smooth/smooth_27.wav",
+        "sound-library/smooth/smooth_39.wav",
+        "sound-library/smooth/smooth_45.wav"
+    };
+    for (int i = 0; i < 5; i++) {
+        if (loadWavFromAssets(mgr, irPaths[i], h->irLayers[i].data)) {
+            h->activeIrCount++;
+        }
+    }
+    LOGI("Loaded %d IR layers", h->activeIrCount);
+
+    // Set default preset IR volumes (I4)
+    h->currentPreset = "I4";
+    for (int l = 0; l < h->MAX_IR_LAYERS; l++) h->irLayers[l].volume = 0.0f;
+    h->irLayers[3].volume = 1.0f;  // smooth_39 main
+    h->irLayers[0].volume = 0.3f;  // smooth_01 aux
+
+    // --- Initialize AAudio engine ---
+    h->audioEngine = std::make_unique<AAudioEngine>();
+
+    if (!h->audioEngine->initialize(sampleRate, channelCount, bufferSizeFrames)) {
+        LOGE("Failed to initialize AAudio engine");
+        h->audioEngine.reset();
+        return JNI_FALSE;
+    }
+
+    h->audioEngine->setVolume(h->volume);
+
+    // --- Start audio pump thread ---
+    h->audioPumpRunning.store(true);
+    h->audioPumpThread = new std::thread(audioPump, h);
+
+    LOGI("Audio initialized successfully (direct synthesis + FIR convolution)");
+    return JNI_TRUE;
+}
+
+JNIEXPORT jboolean JNICALL
+Java_com_enginesim_app_EngineSimLibrary_nativeLoadEnginePreset(JNIEnv* env, jobject thiz,
+    jlong handle, jstring presetName, jint cylinderCount, jfloat boreMm,
+    jfloat strokeMm, jfloat compressionRatio) {
+
+    if (handle == 0) return JNI_FALSE;
+
+    EngineSimHandle* h = reinterpret_cast<EngineSimHandle*>(handle);
+    h->cylinderCount = cylinderCount;
+
+    const char* name = env->GetStringUTFChars(presetName, nullptr);
+    std::string presetStr = name ? name : "I4";
+    LOGI("Loading preset: %s (cylinders=%d, bore=%.1fmm, stroke=%.1fmm, comp=%.1f)",
+         name, cylinderCount, boreMm, strokeMm, compressionRatio);
+    env->ReleaseStringUTFChars(presetName, name);
+
+    // Set IR layers based on preset
+    h->currentPreset = presetStr;
+    // Reset all volumes
+    for (int l = 0; l < EngineSimHandle::MAX_IR_LAYERS; l++)
+        h->irLayers[l].volume = 0.0f;
+
+    // IR index: 0=smooth_01, 1=smooth_05, 2=smooth_27, 3=smooth_39, 4=smooth_45
+    if (h->currentPreset == "I4") {
+        h->irLayers[3].volume = 1.0f;  // smooth_39 main
+        h->irLayers[0].volume = 0.3f;  // smooth_01 aux
+    } else if (h->currentPreset == "V6") {
+        h->irLayers[0].volume = 1.0f;  // smooth_01 main
+        h->irLayers[2].volume = 0.4f;  // smooth_27 rumble
+    } else if (h->currentPreset == "V8") {
+        h->irLayers[2].volume = 1.0f;  // smooth_27 main
+        h->irLayers[0].volume = 0.5f;  // smooth_01 aux
+        h->irLayers[4].volume = 0.2f;  // smooth_45 reverb
+    } else if (h->currentPreset == "V12") {
+        h->irLayers[0].volume = 1.0f;  // smooth_01 main
+        h->irLayers[1].volume = 0.4f;  // smooth_05 aux
+        h->irLayers[4].volume = 0.3f;  // smooth_45 reverb
+    } else {
+        h->irLayers[3].volume = 1.0f;  // fallback
+    }
+
+    LOGI("Preset IR volumes: L0=%.2f L1=%.2f L2=%.2f L3=%.2f L4=%.2f",
+         h->irLayers[0].volume, h->irLayers[1].volume,
+         h->irLayers[2].volume, h->irLayers[3].volume,
+         h->irLayers[4].volume);
+
+    return JNI_TRUE;
+}
+
+JNIEXPORT jboolean JNICALL
+Java_com_enginesim_app_EngineSimLibrary_nativeLoadEnginePresetByName(JNIEnv* env, jobject thiz,
+    jlong handle, jstring presetName) {
+
+    if (handle == 0) return JNI_FALSE;
+
+    const char* name = env->GetStringUTFChars(presetName, nullptr);
+    LOGI("Loading preset by name: %s", name);
+    env->ReleaseStringUTFChars(presetName, name);
+
+    return JNI_TRUE;
+}
+
+} // extern "C"

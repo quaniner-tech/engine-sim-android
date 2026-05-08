@@ -1,0 +1,36 @@
+{
+  "name": "V12",
+  "description": "12-cylinder V-engine - common in supercars and luxury vehicles",
+  "cylinder_count": 12,
+  "bank_count": 2,
+  "bank_angle_degrees": 60,
+  "configuration": "v",
+  "bore_mm": 82.0,
+  "stroke_mm": 72.0,
+  "compression_ratio": 11.8,
+  "displacement_cc": 6262,
+  "max_rpm": 9000,
+  "redline_rpm": 8500,
+  "fuel_type": "gasoline",
+  "cylinder_head": {
+    "type": "dual_overhead_cam",
+    "valves_per_cylinder": 4,
+    "intake_runner_length_mm": 80,
+    "exhaust_runner_length_mm": 65
+  },
+  "intake": {
+    "type": "naturally_aspirated",
+    "runner_count": 2,
+    "plenum_volume_cc": 2400
+  },
+  "exhaust": {
+    "type": "6.into.2.into.2",
+    "primary_pipe_diameter_mm": 45,
+    "collector_diameter_mm": 76
+  },
+  "ignition": {
+    "type": "electronic",
+    "timing_advance_degrees": 15
+  },
+  "characteristic": "Silky smooth, high-pitched wail, ultimate refinement"
+}

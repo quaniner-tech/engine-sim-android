@@ -1,0 +1,97 @@
+plugins {
+    id 'com.android.library'
+    id 'org.jetbrains.kotlin.android'
+    id 'maven-publish'
+}
+
+android {
+    namespace 'com.enginesim'
+    compileSdk 34
+
+    defaultConfig {
+        minSdk 26
+        targetSdk 34
+        versionCode 1
+        versionName "1.0.0"
+
+        externalNativeBuild {
+            cmake {
+                cppFlags "-std=c++17 -fno-rtti -fno-exceptions"
+                arguments += [
+                    "-DANDROID_STL=c++_static",
+                    "-DCMAKE_POSITION_INDEPENDENT_CODE=ON"
+                ]
+            }
+        }
+
+        ndk {
+            abiFilters += ["armeabi-v7a", "arm64-v8a", "x86", "x86_64"]
+        }
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled false
+            consumerProguardFiles 'proguard-rules.pro'
+        }
+        debug {
+            debuggable true
+        }
+    }
+
+    // Native build handled by :app
+    // externalNativeBuild {
+    //     cmake {
+    //         path "../../core/CMakeLists.txt"
+    //         version "3.22.1"
+    //     }
+    // }
+
+    // Native build is handled by :app module
+    // buildFeatures {
+    //     prefab true
+    // }
+}
+
+afterEvaluate {
+publishing {
+    publications {
+        release(MavenPublication) {
+            groupId = 'com.enginesim'
+            artifactId = 'engine-sim-android'
+            version = '1.0.0'
+
+            from components.release
+
+            pom {
+                name = 'Engine-Sim Android Library'
+                description = 'Engine simulation library for Android with JNI and AAudio support'
+                licenses {
+                    license {
+                        name = 'MIT License'
+                        url = 'https://opensource.org/licenses/MIT'
+                    }
+                }
+                developers {
+                    developer {
+                        id = 'engine-sim-android'
+                        name = 'Engine-Sim Android Contributors'
+                    }
+                }
+                scm {
+                    url = 'https://github.com/engine-sim/engine-sim-android'
+                    connection = 'scm:git@github.com:engine-sim/engine-sim-android.git'
+                    developerConnection = 'scm:git@github.com:engine-sim/engine-sim-android.git'
+                }
+            }
+        }
+    }
+
+    repositories {
+        maven {
+            name = 'MavenLocal'
+            url = "$System.env.HOME/.m2/repository"
+        }
+    }
+}
+}

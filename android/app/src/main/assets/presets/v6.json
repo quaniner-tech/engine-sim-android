@@ -1,0 +1,36 @@
+{
+  "name": "V6",
+  "description": "6-cylinder V-engine - common in sports cars and SUVs",
+  "cylinder_count": 6,
+  "bank_count": 2,
+  "bank_angle_degrees": 60,
+  "configuration": "v",
+  "bore_mm": 91.0,
+  "stroke_mm": 76.0,
+  "compression_ratio": 11.8,
+  "displacement_cc": 2997,
+  "max_rpm": 7500,
+  "redline_rpm": 7000,
+  "fuel_type": "gasoline",
+  "cylinder_head": {
+    "type": "dual_overhead_cam",
+    "valves_per_cylinder": 4,
+    "intake_runner_length_mm": 130,
+    "exhaust_runner_length_mm": 100
+  },
+  "intake": {
+    "type": "naturally_aspirated",
+    "runner_count": 2,
+    "plenum_volume_cc": 1200
+  },
+  "exhaust": {
+    "type": "2.into.1.into.2",
+    "primary_pipe_diameter_mm": 45,
+    "collector_diameter_mm": 58
+  },
+  "ignition": {
+    "type": "electronic",
+    "timing_advance_degrees": 12
+  },
+  "characteristic": "Broad power band, aggressive exhaust note"
+}

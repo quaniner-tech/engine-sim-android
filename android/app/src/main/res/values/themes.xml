@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Base Theme -->
+    <style name="Theme.EngineSim" parent="android:Theme.Material.NoActionBar">
+        <item name="android:statusBarColor">@color/background_dark</item>
+        <item name="android:navigationBarColor">@color/background_dark</item>
+        <item name="android:windowBackground">@color/background_dark</item>
+    </style>
+
+    <!-- Legacy alias -->
+    <style name="EngineSimTheme" parent="Theme.EngineSim">
+        <item name="android:statusBarColor">@color/background_dark</item>
+        <item name="android:navigationBarColor">@color/background_dark</item>
+        <item name="android:windowBackground">@color/background_dark</item>
+    </style>
+
+    <!-- Colors -->
+    <color name="background_dark">#FF1A1A1A</color>
+    <color name="surface_dark">#FF2D2D2D</color>
+    <color name="primary_green">#FF4CAF50</color>
+    <color name="primary_blue">#FF2196F3</color>
+    <color name="warning_orange">#FFFF9800</color>
+    <color name="danger_red">#FFFF5722</color>
+    <color name="text_primary">#FFFFFFFF</color>
+    <color name="text_secondary">#FF888888</color>
+    <color name="text_disabled">#FF666666</color>
+    <color name="gauge_background">#FF333333</color>
+
+    <!-- RPM Zone Colors -->
+    <color name="rpm_safe">#FF4CAF50</color>
+    <color name="rpm_caution">#FFFF9800</color>
+    <color name="rpm_danger">#FFFF5722</color>
+</resources>

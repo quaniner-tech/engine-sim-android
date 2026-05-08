@@ -1,0 +1,36 @@
+{
+  "name": "V8",
+  "description": "8-cylinder V-engine - common in muscle cars and trucks",
+  "cylinder_count": 8,
+  "bank_count": 2,
+  "bank_angle_degrees": 90,
+  "configuration": "v",
+  "bore_mm": 103.0,
+  "stroke_mm": 77.0,
+  "compression_ratio": 10.7,
+  "displacement_cc": 5120,
+  "max_rpm": 7000,
+  "redline_rpm": 6500,
+  "fuel_type": "gasoline",
+  "cylinder_head": {
+    "type": "dual_overhead_cam",
+    "valves_per_cylinder": 4,
+    "intake_runner_length_mm": 100,
+    "exhaust_runner_length_mm": 80
+  },
+  "intake": {
+    "type": "naturally_aspirated",
+    "runner_count": 2,
+    "plenum_volume_cc": 2000
+  },
+  "exhaust": {
+    "type": "4.into.1.into.2",
+    "primary_pipe_diameter_mm": 51,
+    "collector_diameter_mm": 64
+  },
+  "ignition": {
+    "type": "electronic",
+    "timing_advance_degrees": 14
+  },
+  "characteristic": "Deep rumble, massive torque, aggressive character"
+}

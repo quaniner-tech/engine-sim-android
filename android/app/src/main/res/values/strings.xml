@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Engine Simulator</string>
+
+    <!-- Engine Controls -->
+    <string name="start_engine">START ENGINE</string>
+    <string name="stop_engine">STOP ENGINE</string>
+    <string name="throttle">Throttle</string>
+
+    <!-- Engine Presets -->
+    <string name="preset_inline4">I4</string>
+    <string name="preset_v6">V6</string>
+    <string name="preset_v8">V8</string>
+    <string name="preset_v12">V12</string>
+
+    <!-- Dashboard Labels -->
+    <string name="label_rpm">RPM</string>
+    <string name="label_torque">TORQUE</string>
+    <string name="label_power">POWER</string>
+    <string name="label_volume">VOLUME</string>
+
+    <!-- Units -->
+    <string name="unit_rpm">RPM</string>
+    <string name="unit_nm">Nm</string>
+    <string name="unit_hp">HP</string>
+    <string name="unit_percent">%</string>
+
+    <!-- Engine Preset Descriptions -->
+    <string name="desc_inline4">4-cylinder inline engine</string>
+    <string name="desc_v6">6-cylinder V-engine</string>
+    <string name="desc_v8">8-cylinder V-engine</string>
+    <string name="desc_v12">12-cylinder V-engine</string>
+
+    <!-- Status Messages -->
+    <string name="status_audio_init_failed">Audio initialization failed</string>
+    <string name="status_engine_started">Engine started</string>
+    <string name="status_engine_stopped">Engine stopped</string>
+    <string name="status_engine_running">Running</string>
+    <string name="status_engine_idle">Idle</string>
+</resources>
