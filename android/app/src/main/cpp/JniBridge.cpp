@@ -146,6 +146,11 @@ static void audioPump(EngineSimHandle* h) {
     int historyLen = maxIrLen + chunkSize;
     std::vector<float> history(historyLen, 0.0f);
     int histWritePos = 0;
+    
+    // Separate jitter history (exhaust flow timing variation)
+    const int jitterHistLen = 64;
+    std::vector<float> jitterHistory(jitterHistLen, 0.0f);
+    int jitterWritePos = 0;
     int writeCount = 0;
 
     double crankAngle = 0.0;
@@ -220,9 +225,17 @@ static void audioPump(EngineSimHandle* h) {
                 // Add idle base flow
                 exhaustFlow += 0.02f;
 
-                // === 2. Jitter filter (subtle randomness) ===
-                float jitter = nextNoise() * 0.002f;
-                float f_in = exhaustFlow + jitter;
+                // === 2. Engine-sim style Jitter (timing variation via history buffer) ===
+                // Store exhaust flow in jitter history
+                jitterHistory[jitterWritePos % jitterHistLen] = exhaustFlow;
+                jitterWritePos++;
+                
+                // Read from history with slight random offset (engine-sim jitter style)
+                float jitterAmount = 3.0f;  // max 3 samples offset
+                float jitterOffset = nextNoise() * jitterAmount;
+                int readIdx = jitterWritePos - 1 - (int)std::round(jitterOffset);
+                if (readIdx < 0) readIdx += jitterHistLen;
+                float f_in = jitterHistory[readIdx % jitterHistLen];
                 
                 // === 3. DC filter (1-pole highpass) ===
                 prevDc = prevDc + 0.99f * (f_in - prevDc);
@@ -277,8 +290,11 @@ static void audioPump(EngineSimHandle* h) {
                     dF_F_mix = 0.15f;                     // Fixed low engine mix
                 }
                 
-                // Engine-sim style signal processing (f_p = derivative, f = AC component)
-                float v_in = f_deriv * dF_F_mix + f_ac * (1.0f - dF_F_mix);
+                // Engine-sim style signal processing
+                // v_in = f_p * dF_F_mix + f * r_mixed * (1 - dF_F_mix)
+                // r_mixed = airNoise * filteredNoise + (1 - airNoise)
+                float r_mixed = airNoise * prevFilteredNoise + (1.0f - airNoise);
+                float v_in = f_deriv * dF_F_mix + f_ac * r_mixed * (1.0f - dF_F_mix);
 
                 // === 7. Backfire / popcorn ===
                 double throttleDelta = h->prevSmoothThrottle - smoothThrottle;
