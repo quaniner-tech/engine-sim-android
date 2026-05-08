@@ -301,11 +301,11 @@ static void audioPump(EngineSimHandle* h) {
                     float f_deriv = (f_in - cylPrevSample[c]) * (float)sr;
                     cylPrevSample[c] = f_in;
 
-                    // RPM-based bass boost
-                    if (rpm < 2000.0f) {
-                        f_deriv *= (2.0f + 1.0f * (rpm / 2000.0f));
-                    } else if (rpm < 4000.0f) {
-                        f_deriv *= (3.0f - 2.0f * ((rpm - 2000.0f) / 2000.0f));
+                    // RPM-based bass boost (풍부한 저음)
+                    if (rpm < 2500.0f) {
+                        f_deriv *= (3.0f + 2.0f * (rpm / 2500.0f));  // 3.0x → 5.0x
+                    } else if (rpm < 5000.0f) {
+                        f_deriv *= (5.0f - 4.0f * ((rpm - 2500.0f) / 2500.0f));  // 5.0x → 1.0x
                     }
 
                     // Engine-sim style v_in
