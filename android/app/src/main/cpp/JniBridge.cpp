@@ -52,7 +52,7 @@ struct EngineSimHandle {
     std::atomic<bool> audioPumpRunning{false};
 
     // Multi-layer impulse responses (6 slots)
-    static const int MAX_IR_LAYERS = 6;
+    static const int MAX_IR_LAYERS = 15;
     ImpulseLayer irLayers[MAX_IR_LAYERS];
     int activeIrCount = 0;
 
@@ -183,7 +183,19 @@ static void audioPump(EngineSimHandle* h) {
                 smoothRpm += (targetRpm - smoothRpm) * 0.005;
                 smoothThrottle += (targetThrottle - smoothThrottle) * 0.01;
 
-                double crankRadPerSample = (smoothRpm / 60.0) * 2.0 * M_PI / sr;
+                // RPM-based pitch adjustment (more realistic engine sound)
+                const float rpm = smoothRpm;
+                float pitchMultiplier = 1.0f;
+                
+                if (rpm < 2000.0f) {
+                    // At low RPM: deeper, more realistic idle sound
+                    pitchMultiplier = 0.8f + 0.2f * (rpm / 2000.0f);  // 0.8 to 1.0
+                } else if (rpm > 4000.0f) {
+                    // At high RPM: slight reduction for realism (engines don't get higher pitched)
+                    pitchMultiplier = 1.0f - 0.05f * std::min(1.0f, (rpm - 4000.0f) / 2000.0f);  // 1.0 to 0.95
+                }
+                
+                double crankRadPerSample = (smoothRpm / 60.0) * 2.0 * M_PI / sr * pitchMultiplier;
 
                 // === 1. Generate exhaust flow (physical model) ===
                 float exhaustFlow = 0.0f;
@@ -211,7 +223,7 @@ static void audioPump(EngineSimHandle* h) {
                 // === 2. Jitter filter (subtle randomness) ===
                 float jitter = nextNoise() * 0.002f;
                 float f_in = exhaustFlow + jitter;
-
+                
                 // === 3. DC filter (1-pole highpass) ===
                 prevDc = prevDc + 0.99f * (f_in - prevDc);
                 float f_ac = f_in - prevDc;  // AC component
@@ -226,9 +238,33 @@ static void audioPump(EngineSimHandle* h) {
                 prevFilteredNoise = prevFilteredNoise + noiseAlpha * (noise - prevFilteredNoise);
                 float noiseMixed = 0.5f * prevFilteredNoise + 0.5f;
 
-                // === 6. v_in synthesis ===
-                // dF_F_mix = 0.01: 1% derivative + 99% AC * noise
-                float v_in = f_deriv * 0.01f + f_ac * noiseMixed * 0.99f;
+                // === 6. v_in synthesis with RPM-based noise reduction ===
+                
+                // Adjust noise mixing based on RPM
+                float noiseMix = 0.99f;  // Default high noise mix
+                float engineMix = 0.01f;  // Default low engine mix
+                
+                // At low RPM: reduce noise, emphasize engine sound (툭툭툭)
+                if (rpm < 1500.0f) {
+                    float lowRpmFactor = rpm / 1500.0f;  // 0 to 1
+                    noiseMix = 0.70f + 0.29f * lowRpmFactor;  // 0.70 to 0.99
+                    engineMix = 0.30f - 0.29f * lowRpmFactor;  // 0.30 to 0.01
+                }
+                
+                // At medium RPM: balanced mix
+                else if (rpm < 3000.0f) {
+                    float medRpmFactor = (rpm - 1500.0f) / 1500.0f;  // 0 to 1
+                    noiseMix = 0.85f + 0.14f * medRpmFactor;  // 0.85 to 0.99
+                    engineMix = 0.15f - 0.14f * medRpmFactor;  // 0.15 to 0.01
+                }
+                
+                // At high RPM: more noise for realism
+                else {
+                    noiseMix = 0.99f;
+                    engineMix = 0.01f;
+                }
+                
+                float v_in = f_deriv * engineMix + f_ac * noiseMixed * noiseMix;
 
                 // === 7. Backfire / popcorn ===
                 double throttleDelta = h->prevSmoothThrottle - smoothThrottle;
@@ -279,22 +315,66 @@ static void audioPump(EngineSimHandle* h) {
                 history[histWritePos % historyLen] = v_in;
                 histWritePos++;
 
-                // === 8. Multi-layer FIR convolution ===
+                // === 8. Engine-sim style gradual convolution mixing ===
+                const float convAmount = std::min(1.0f, static_cast<float>(smoothRpm) / 4000.0f);  // 0 to 1 based on RPM
+                const float baseAmount = 1.0f - convAmount;
+                
+                // RPM-based dynamic IR selection with enhanced mixing
                 float convOut = 0.0f;
+                float totalVolume = 0.0f;
+                
+                // Use preset volumes as base, with RPM-based enhancement
+                float rpmVolumes[EngineSimHandle::MAX_IR_LAYERS];
                 for (int l = 0; l < EngineSimHandle::MAX_IR_LAYERS; l++) {
-                    float vol = h->irLayers[l].volume;
+                    rpmVolumes[l] = h->irLayers[l].volume;  // Start with preset volumes
+                }
+                
+                // RPM-based enhancement (multiply preset volumes)
+                if (rpm < 2000.0f) {
+                    // Low RPM: enhance smooth IRs
+                    rpmVolumes[0] *= 1.8f;  // smooth_01 main emphasis
+                    rpmVolumes[7] *= 1.4f;  // smooth_02 secondary
+                    rpmVolumes[1] *= 1.2f;  // smooth_05 light
+                }
+                else if (rpm < 4000.0f) {
+                    // Mid RPM: balanced enhancement
+                    rpmVolumes[2] *= 1.5f;  // smooth_10 sporty
+                    rpmVolumes[5] *= 1.3f;  // smooth_39 main
+                    rpmVolumes[9] *= 1.2f;  // smooth_15 character
+                }
+                else {
+                    // High RPM: performance enhancement  
+                    rpmVolumes[4] *= 1.6f;  // smooth_27 rumble main
+                    rpmVolumes[11] *= 1.4f; // smooth_30 racing
+                    rpmVolumes[6] *= 1.2f;  // smooth_45 high end
+                    rpmVolumes[12] *= 1.1f; // smooth_35 turbo
+                }
+                
+                // Apply RPM-adjusted volumes for convolution
+                for (int l = 0; l < EngineSimHandle::MAX_IR_LAYERS; l++) {
+                    float vol = rpmVolumes[l];
                     if (vol <= 0.0f) continue;
+                    
                     int irLen = (int)h->irLayers[l].data.size();
                     for (int j = 0; j < irLen; j++) {
                         int idx = histWritePos - 1 - j;
                         while (idx < 0) idx += historyLen;
                         convOut += history[idx % historyLen] * h->irLayers[l].data[j] * vol;
                     }
+                    totalVolume += vol;
                 }
-
+                
+                // Normalize convolution result
+                if (totalVolume > 0.0f) {
+                    convOut /= totalVolume;
+                }
+                
+                // Engine-sim style: gradual blending (not baseConv + enhancedConv)
+                float finalConv = baseAmount * v_in + convAmount * convOut;
+                
                 // === 9. Anti-aliasing LPF ===
                 float aaAlpha = 0.4f;
-                float antiAliased = prevAntiAlias + aaAlpha * (convOut - prevAntiAlias);
+                float antiAliased = prevAntiAlias + aaAlpha * (finalConv - prevAntiAlias);
                 prevAntiAlias = antiAliased;
 
                 // === 10. Leveling filter (RMS-based AGC) ===
@@ -500,14 +580,24 @@ Java_com_enginesim_app_EngineSimLibrary_nativeInitializeAudio(JNIEnv* env, jobje
 
     // Load all IR layers
     // Index: 0=smooth_01, 1=smooth_05, 2=smooth_27, 3=smooth_39, 4=smooth_45
-    const char* irPaths[5] = {
-        "sound-library/smooth/smooth_01.wav",
-        "sound-library/smooth/smooth_05.wav",
-        "sound-library/smooth/smooth_27.wav",
-        "sound-library/smooth/smooth_39.wav",
-        "sound-library/smooth/smooth_45.wav"
+    const char* irPaths[15] = {
+        "sound-library/smooth/smooth_01.wav",    // Low RPM smooth
+        "sound-library/smooth/smooth_05.wav",    // Mid-low RPM
+        "sound-library/smooth/smooth_10.wav",    // Mid RPM sporty
+        "sound-library/smooth/smooth_17.wav",    // Mid-high RPM
+        "sound-library/smooth/smooth_27.wav",    // High RPM rumble
+        "sound-library/smooth/smooth_39.wav",    // Very high RPM
+        "sound-library/smooth/smooth_45.wav",    // Ultra high RPM
+        "sound-library/smooth/smooth_02.wav",    // Alternative low RPM
+        "sound-library/smooth/smooth_08.wav",    // Alternative mid RPM
+        "sound-library/smooth/smooth_15.wav",    // Sporty mid RPM
+        "sound-library/smooth/smooth_22.wav",    // High performance
+        "sound-library/smooth/smooth_30.wav",    // Racing style
+        "sound-library/smooth/smooth_35.wav",    // Turbo sound
+        "sound-library/smooth/smooth_40.wav",    // Track day
+        "sound-library/smooth/smooth_48.wav"     // Extreme RPM
     };
-    for (int i = 0; i < 5; i++) {
+    for (int i = 0; i < 15; i++) {
         if (loadWavFromAssets(mgr, irPaths[i], h->irLayers[i].data)) {
             h->activeIrCount++;
         }
@@ -517,8 +607,11 @@ Java_com_enginesim_app_EngineSimLibrary_nativeInitializeAudio(JNIEnv* env, jobje
     // Set default preset IR volumes (I4)
     h->currentPreset = "I4";
     for (int l = 0; l < h->MAX_IR_LAYERS; l++) h->irLayers[l].volume = 0.0f;
-    h->irLayers[3].volume = 1.0f;  // smooth_39 main
-    h->irLayers[0].volume = 0.3f;  // smooth_01 aux
+    // 4-cylinder engine: balanced sound across RPM range
+    h->irLayers[5].volume = 0.6f;  // smooth_39 - main mid-high RPM
+    h->irLayers[0].volume = 0.3f;  // smooth_01 - low RPM smooth
+    h->irLayers[2].volume = 0.2f;  // smooth_10 - sporty character
+    h->irLayers[8].volume = 0.2f;  // smooth_08 - alternative tone
 
     // --- Initialize AAudio engine ---
     h->audioEngine = std::make_unique<AAudioEngine>();
@@ -557,33 +650,50 @@ Java_com_enginesim_app_EngineSimLibrary_nativeLoadEnginePreset(JNIEnv* env, jobj
 
     // Set IR layers based on preset
     h->currentPreset = presetStr;
-    // Reset all volumes
+    // Keep all WAV data, just adjust volumes for different character
     for (int l = 0; l < EngineSimHandle::MAX_IR_LAYERS; l++)
-        h->irLayers[l].volume = 0.0f;
+        h->irLayers[l].volume = 0.0f;  // Reset, but WAV data remains
 
-    // IR index: 0=smooth_01, 1=smooth_05, 2=smooth_27, 3=smooth_39, 4=smooth_45
+    // 15-layer IR index: 0=smooth_01, 1=smooth_05, 2=smooth_10, 3=smooth_17, 4=smooth_27
+    //  5=smooth_39, 6=smooth_45, 7=smooth_02, 8=smooth_08, 9=smooth_15
+    //  10=smooth_22, 11=smooth_30, 12=smooth_35, 13=smooth_40, 14=smooth_48
     if (h->currentPreset == "I4") {
-        h->irLayers[3].volume = 1.0f;  // smooth_39 main
-        h->irLayers[0].volume = 0.3f;  // smooth_01 aux
+        h->irLayers[5].volume = 0.5f;  // smooth_39 - main character
+        h->irLayers[0].volume = 0.4f;  // smooth_01 - smooth low end
+        h->irLayers[2].volume = 0.3f;  // smooth_10 - sporty mid
+        h->irLayers[8].volume = 0.2f;  // smooth_08 - alternative tone
+        h->irLayers[7].volume = 0.2f;  // smooth_02 - warm character
+        h->irLayers[9].volume = 0.15f; // smooth_15 - bright
     } else if (h->currentPreset == "V6") {
-        h->irLayers[0].volume = 1.0f;  // smooth_01 main
-        h->irLayers[2].volume = 0.4f;  // smooth_27 rumble
+        h->irLayers[1].volume = 0.5f;  // smooth_05 - smooth V6 character
+        h->irLayers[4].volume = 0.4f;  // smooth_27 - V6 rumble
+        h->irLayers[9].volume = 0.3f;  // smooth_15 - sporty V6 tone
+        h->irLayers[11].volume = 0.2f; // smooth_30 - racing V6
+        h->irLayers[0].volume = 0.2f;  // smooth_01 - low end
+        h->irLayers[3].volume = 0.15f; // smooth_17 - mid-high
     } else if (h->currentPreset == "V8") {
-        h->irLayers[2].volume = 1.0f;  // smooth_27 main
-        h->irLayers[0].volume = 0.5f;  // smooth_01 aux
-        h->irLayers[4].volume = 0.2f;  // smooth_45 reverb
+        h->irLayers[4].volume = 0.6f;  // smooth_27 - V8 rumble main
+        h->irLayers[0].volume = 0.3f;  // smooth_01 - low end
+        h->irLayers[12].volume = 0.3f; // smooth_35 - turbo V8
+        h->irLayers[7].volume = 0.2f;  // smooth_02 - alternative V8
+        h->irLayers[2].volume = 0.15f; // smooth_10 - bite
+        h->irLayers[14].volume = 0.1f; // smooth_48 - extreme
     } else if (h->currentPreset == "V12") {
-        h->irLayers[0].volume = 1.0f;  // smooth_01 main
-        h->irLayers[1].volume = 0.4f;  // smooth_05 aux
-        h->irLayers[4].volume = 0.3f;  // smooth_45 reverb
+        h->irLayers[1].volume = 0.4f;  // smooth_05 - smooth V12
+        h->irLayers[6].volume = 0.4f;  // smooth_45 - high-end V12
+        h->irLayers[10].volume = 0.3f; // smooth_22 - performance V12
+        h->irLayers[13].volume = 0.2f; // smooth_40 - track V12
+        h->irLayers[5].volume = 0.2f;  // smooth_39 - mid presence
+        h->irLayers[3].volume = 0.15f; // smooth_17 - refinement
     } else {
-        h->irLayers[3].volume = 1.0f;  // fallback
+        h->irLayers[5].volume = 0.5f;  // smooth_39 fallback main
+        h->irLayers[0].volume = 0.3f;  // smooth_01 fallback aux
     }
 
-    LOGI("Preset IR volumes: L0=%.2f L1=%.2f L2=%.2f L3=%.2f L4=%.2f",
-         h->irLayers[0].volume, h->irLayers[1].volume,
-         h->irLayers[2].volume, h->irLayers[3].volume,
-         h->irLayers[4].volume);
+    LOGI("Preset IR volumes: L0=%.2f L1=%.2f L2=%.2f L3=%.2f L4=%.2f L5=%.2f L6=%.2f L7=%.2f",
+         h->irLayers[0].volume, h->irLayers[1].volume, h->irLayers[2].volume,
+         h->irLayers[3].volume, h->irLayers[4].volume, h->irLayers[5].volume,
+         h->irLayers[6].volume, h->irLayers[7].volume);
 
     return JNI_TRUE;
 }
