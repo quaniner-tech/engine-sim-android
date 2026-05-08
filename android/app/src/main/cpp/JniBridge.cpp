@@ -150,6 +150,16 @@ static void audioPump(EngineSimHandle* h) {
     int historyLen = maxIrLen + chunkSize;
     std::vector<float> history(historyLen, 0.0f);
     int histWritePos = 0;
+
+    // Per-cylinder filter state (engine-sim: each cylinder has independent filters)
+    static const int MAX_CYL = 12;
+    float cylPrevDc[MAX_CYL] = {0};
+    float cylPrevSample[MAX_CYL] = {0};
+    int cylJitterWritePos[MAX_CYL] = {0};
+    std::vector<float> cylJitterHistory[MAX_CYL];
+    for (int c = 0; c < MAX_CYL; c++) {
+        cylJitterHistory[c].resize(64, 0.0f);
+    }
     
     // Separate jitter history (exhaust flow timing variation)
     const int jitterHistLen = 64;
@@ -168,8 +178,7 @@ static void audioPump(EngineSimHandle* h) {
     double smoothThrottle = 0.0;
 
     // Engine-sim pipeline state
-    float prevSample = 0.0f;       // for derivative
-    float prevDc = 0.0f;           // DC filter state
+    float prevSample = 0.0f;       // unused (per-cylinder now)
     float prevFilteredNoise = 0.0f;// air noise LPF state
     float prevAntiAlias = 0.0f;    // anti-aliasing LPF state
     float levelPeak = 0.001f;       // engine-sim leveling: peak tracker
@@ -238,14 +247,29 @@ static void audioPump(EngineSimHandle* h) {
                 
                 double crankRadPerSample = (smoothRpm / 60.0) * 2.0 * M_PI / sr * pitchMultiplier;
 
-                // === 1. Generate exhaust flow (physical model) ===
-                float exhaustFlow = 0.0f;
+                // === 1. Per-cylinder exhaust flow + filter chain (engine-sim style) ===
                 float throttle = (float)smoothThrottle;
-                // Ensure minimum throttle for exhaust pulse generation (cranking + idle)
-                if (throttle < 0.1f) {
-                    throttle = 0.1f;
+                if (throttle < 0.1f) throttle = 0.1f;
+
+                // Engine-sim style: airNoise & dF_F_mix parameters
+                float airNoise = 1.0f;
+                float dF_F_mix = 0.01f;
+                if (rpm < 1500.0f) {
+                    float f = rpm / 1500.0f;
+                    airNoise = 0.2f + 0.3f * f;
+                    dF_F_mix = 0.4f - 0.39f * f;
+                } else if (rpm < 3000.0f) {
+                    float f = (rpm - 1500.0f) / 1500.0f;
+                    airNoise = 0.5f + 0.4f * f;
+                    dF_F_mix = 0.01f + 0.14f * f;
+                } else {
+                    airNoise = 1.0f;
+                    dF_F_mix = 0.15f;
                 }
 
+                // Each cylinder gets its own jitter → DC → derivative
+                float signal = 0.0f;
+                
                 for (int c = 0; c < h->cylinderCount; c++) {
                     double cylOffset = (720.0 / h->cylinderCount) * c;
                     double crankDeg = std::fmod(crankAngle * 180.0 / M_PI, 720.0);
@@ -254,87 +278,47 @@ static void audioPump(EngineSimHandle* h) {
                     if (cylDeg < 0) cylDeg += 720.0;
 
                     // Exhaust valve open: ~130° to ~400° in 720° cycle
+                    float cylExhaust = 0.0f;
                     if (cylDeg > 130.0 && cylDeg < 400.0) {
                         double t = (cylDeg - 130.0) / 270.0;
-                        exhaustFlow += (float)(std::exp(-t * 3.0) * throttle);
+                        cylExhaust = (float)(std::exp(-t * 3.0) * throttle);
                     }
+                    cylExhaust += 0.02f; // idle base
+
+                    // Per-cylinder Jitter
+                    cylJitterHistory[c][cylJitterWritePos[c] % 64] = cylExhaust;
+                    cylJitterWritePos[c]++;
+                    float jitterOff = nextNoise() * 3.0f;
+                    int jReadIdx = cylJitterWritePos[c] - 1 - (int)std::round(jitterOff);
+                    if (jReadIdx < 0) jReadIdx += 64;
+                    float f_in = cylJitterHistory[c][jReadIdx % 64];
+
+                    // Per-cylinder DC filter
+                    cylPrevDc[c] = cylPrevDc[c] + 0.99f * (f_in - cylPrevDc[c]);
+                    float f_ac = f_in - cylPrevDc[c];
+
+                    // Per-cylinder Derivative
+                    float f_deriv = (f_in - cylPrevSample[c]) * (float)sr;
+                    cylPrevSample[c] = f_in;
+
+                    // RPM-based bass boost
+                    if (rpm < 2000.0f) {
+                        f_deriv *= (2.0f + 1.0f * (rpm / 2000.0f));
+                    } else if (rpm < 4000.0f) {
+                        f_deriv *= (3.0f - 2.0f * ((rpm - 2000.0f) / 2000.0f));
+                    }
+
+                    // Engine-sim style v_in
+                    float r_mixed = airNoise * prevFilteredNoise + (1.0f - airNoise);
+                    float v_in = f_deriv * dF_F_mix + f_ac * r_mixed * (1.0f - dF_F_mix);
+
+                    signal += v_in;
                 }
 
-                exhaustFlow /= (float)h->cylinderCount;
-
-                // Add idle base flow
-                exhaustFlow += 0.02f;
-
-                // === 2. Engine-sim style Jitter (timing variation via history buffer) ===
-                // Store exhaust flow in jitter history
-                jitterHistory[jitterWritePos % jitterHistLen] = exhaustFlow;
-                jitterWritePos++;
-                
-                // Read from history with slight random offset (engine-sim jitter style)
-                float jitterAmount = 3.0f;  // max 3 samples offset
-                float jitterOffset = nextNoise() * jitterAmount;
-                int readIdx = jitterWritePos - 1 - (int)std::round(jitterOffset);
-                if (readIdx < 0) readIdx += jitterHistLen;
-                float f_in = jitterHistory[readIdx % jitterHistLen];
-                
-                // === 3. DC filter (1-pole highpass) ===
-                prevDc = prevDc + 0.99f * (f_in - prevDc);
-                float f_ac = f_in - prevDc;  // AC component
-
-                // === 4. Derivative (transient emphasis) - 강화된 둥둥둥 베이스 ===
-                float f_deriv = (f_in - prevSample) * (float)sr;
-                prevSample = f_in;
-                
-                // RPM-based bass boost for realistic engine thump
-                float bassBoost = 1.0f;
-                if (rpm < 2000.0f) {
-                    // Strong bass at low RPM (툭툭툭)
-                    bassBoost = 2.0f + 1.0f * (rpm / 2000.0f);  // 2.0x to 3.0x
-                    f_deriv *= bassBoost;
-                } else if (rpm < 4000.0f) {
-                    // Gradual reduction in mid RPM
-                    float midRpmFactor = (rpm - 2000.0f) / 2000.0f;  // 0 to 1
-                    bassBoost = 3.0f - 2.0f * midRpmFactor;  // 3.0x to 1.0x
-                    f_deriv *= bassBoost;
-                }
-                // High RPM: natural bass (no extra boost)
-
-                // === 5. Air noise channel ===
+                // === 2. Air noise channel ===
                 float noise = nextNoise();
-                float noiseAlpha = 0.02f;  // lowpass cutoff ~100Hz at 44.1kHz
+                float noiseAlpha = 0.02f;
                 prevFilteredNoise = prevFilteredNoise + noiseAlpha * (noise - prevFilteredNoise);
-                // noiseMix variable removed - using engine-sim style airNoise parameter
-
-                // === 6. v_in synthesis with RPM-based noise reduction ===
-                
-                // Adjust noise mixing based on RPM
-                float noiseMix = 0.99f;  // Default high noise mix
-                // Engine-sim style: airNoise & dF_F_mix parameters
-                float airNoise = 1.0f;      // Air noise amount (0-1)
-                float dF_F_mix = 0.01f;     // Engine vs noise mix (0-1)
-                
-                // RPM-based dynamic adjustment for better engine sound
-                if (rpm < 1500.0f) {
-                    // Low RPM: minimal noise, strong engine thump
-                    float lowRpmFactor = rpm / 1500.0f;  // 0 to 1
-                    airNoise = 0.2f + 0.3f * lowRpmFactor;   // 0.2 to 0.5 (low noise)
-                    dF_F_mix = 0.4f - 0.39f * lowRpmFactor;  // 0.4 to 0.01 (strong engine)
-                } else if (rpm < 3000.0f) {
-                    // Medium RPM: balanced mix
-                    float medRpmFactor = (rpm - 1500.0f) / 1500.0f;  // 0 to 1
-                    airNoise = 0.5f + 0.4f * medRpmFactor;   // 0.5 to 0.9 (increasing noise)
-                    dF_F_mix = 0.01f + 0.14f * medRpmFactor;  // 0.01 to 0.15 (less engine focus)
-                } else {
-                    // High RPM: more realistic noise, less engine focus
-                    airNoise = 0.9f + 0.1f;               // 1.0 (full noise for realism)
-                    dF_F_mix = 0.15f;                     // Fixed low engine mix
-                }
-                
-                // Engine-sim style signal processing
-                // v_in = f_p * dF_F_mix + f * r_mixed * (1 - dF_F_mix)
-                // r_mixed = airNoise * filteredNoise + (1 - airNoise)
-                float r_mixed = airNoise * prevFilteredNoise + (1.0f - airNoise);
-                float v_in = f_deriv * dF_F_mix + f_ac * r_mixed * (1.0f - dF_F_mix);
 
                 // === 7. Backfire / popcorn ===
                 double throttleDelta = h->prevSmoothThrottle - smoothThrottle;
@@ -374,7 +358,7 @@ static void audioPump(EngineSimHandle* h) {
                         double alpha = dt / (rc + dt);
                         double filtered = h->popcornEvents[p].prevFiltered + alpha * (popSample - h->popcornEvents[p].prevFiltered);
                         h->popcornEvents[p].prevFiltered = filtered;
-                        v_in += (float)filtered;
+                        signal += (float)filtered;
                         h->popcornEvents[p].position++;
                         if (h->popcornEvents[p].position >= h->popcornEvents[p].length)
                             h->popcornEvents[p].active = false;
@@ -382,7 +366,7 @@ static void audioPump(EngineSimHandle* h) {
                 }
 
                 // Store in history for convolution
-                history[histWritePos % historyLen] = v_in;
+                history[histWritePos % historyLen] = signal;
                 histWritePos++;
 
                 // === 8. Engine-sim style gradual convolution mixing ===
@@ -440,7 +424,7 @@ static void audioPump(EngineSimHandle* h) {
                 }
                 
                 // Engine-sim style: gradual blending (not baseConv + enhancedConv)
-                float finalConv = baseAmount * v_in + convAmount * convOut;
+                float finalConv = baseAmount * signal + convAmount * convOut;
                 
                 // === 9. Anti-aliasing LPF (engine-sim: cutoff ~0.45*sr = ~19845Hz, nearly passthrough) ===
                 float aaAlpha = 0.95f;  // Very light filtering, engine-sim uses ~19845Hz cutoff
