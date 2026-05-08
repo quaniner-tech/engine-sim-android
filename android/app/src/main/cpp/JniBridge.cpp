@@ -165,7 +165,9 @@ static void audioPump(EngineSimHandle* h) {
     float prevDc = 0.0f;           // DC filter state
     float prevFilteredNoise = 0.0f;// air noise LPF state
     float prevAntiAlias = 0.0f;    // anti-aliasing LPF state
-    float rmsAccum = 0.001f;       // leveling filter RMS
+    float levelPeak = 0.001f;       // engine-sim leveling: peak tracker
+    float levelAttenuation = 1.0f;  // engine-sim leveling: smoothed attenuation
+    float levelTarget = 0.15f;      // engine-sim leveling: target level
     uint32_t rngState = 54321;
 
     // Backfire / popcorn
@@ -407,11 +409,20 @@ static void audioPump(EngineSimHandle* h) {
                 float antiAliased = prevAntiAlias + aaAlpha * (finalConv - prevAntiAlias);
                 prevAntiAlias = antiAliased;
 
-                // === 10. Leveling filter (RMS-based AGC) ===
-                rmsAccum = std::sqrt(rmsAccum * rmsAccum * 0.999f + antiAliased * antiAliased * 0.001f);
-                float targetLevel = 0.15f;
-                float gain = std::min(2.0f, targetLevel / std::max(rmsAccum, 0.001f));
-                float output = antiAliased * gain * h->volume;
+                // === 10. Leveling filter (engine-sim peak-tracking AGC) ===
+                levelPeak = 0.999f * levelPeak;
+                if (std::abs(antiAliased) > levelPeak) levelPeak = std::abs(antiAliased);
+                if (levelPeak > 0.001f) {
+                    float levelAtten = levelTarget / levelPeak;
+                    if (levelAtten < 0.00001f) levelAtten = 0.00001f;
+                    else if (levelAtten > 1.9f) levelAtten = 1.9f;
+                    levelAttenuation = 0.9f * levelAttenuation + 0.1f * levelAtten;
+                }
+                float output = antiAliased * levelAttenuation * h->volume;
+
+                // RPM-based volume boost (up to 1.5x at max RPM)
+                float rpmBoost = 1.0f + 0.5f * std::min(1.0f, rpm / 6800.0f);
+                output *= rpmBoost;
 
                 // Clamp and convert
                 if (output > 1.0f) output = 1.0f;
