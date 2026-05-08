@@ -167,7 +167,7 @@ static void audioPump(EngineSimHandle* h) {
     float prevAntiAlias = 0.0f;    // anti-aliasing LPF state
     float levelPeak = 0.001f;       // engine-sim leveling: peak tracker
     float levelAttenuation = 1.0f;  // engine-sim leveling: smoothed attenuation
-    float levelTarget = 0.15f;      // engine-sim leveling: target level
+    float levelTarget = 0.916f;     // engine-sim: 30000/32768 in float scale
     uint32_t rngState = 54321;
 
     // Backfire / popcorn
@@ -404,8 +404,8 @@ static void audioPump(EngineSimHandle* h) {
                 // Engine-sim style: gradual blending (not baseConv + enhancedConv)
                 float finalConv = baseAmount * v_in + convAmount * convOut;
                 
-                // === 9. Anti-aliasing LPF ===
-                float aaAlpha = 0.4f;
+                // === 9. Anti-aliasing LPF (engine-sim: cutoff ~0.45*sr = ~19845Hz, nearly passthrough) ===
+                float aaAlpha = 0.95f;  // Very light filtering, engine-sim uses ~19845Hz cutoff
                 float antiAliased = prevAntiAlias + aaAlpha * (finalConv - prevAntiAlias);
                 prevAntiAlias = antiAliased;
 
@@ -423,6 +423,10 @@ static void audioPump(EngineSimHandle* h) {
                 // RPM-based volume boost (up to 1.5x at max RPM)
                 float rpmBoost = 1.0f + 0.5f * std::min(1.0f, rpm / 6800.0f);
                 output *= rpmBoost;
+
+                // INT16 hard clipping (engine-sim style)
+                if (output > 1.0f) output = 1.0f;
+                else if (output < -1.0f) output = -1.0f;
 
                 // Clamp and convert
                 if (output > 1.0f) output = 1.0f;
@@ -641,6 +645,20 @@ Java_com_enginesim_app_EngineSimLibrary_nativeInitializeAudio(JNIEnv* env, jobje
     for (int i = 0; i < 15; i++) {
         if (loadWavFromAssets(mgr, irPaths[i], h->irLayers[i].data)) {
             h->activeIrCount++;
+        }
+    }
+    // Apply engine-sim style IR clipping: trim trailing samples where abs <= 100 (in int16 scale)
+    for (int l = 0; l < h->MAX_IR_LAYERS; l++) {
+        if (h->irLayers[l].data.empty()) continue;
+        int clippedLen = 0;
+        for (size_t j = 0; j < h->irLayers[l].data.size(); j++) {
+            if (std::abs(h->irLayers[l].data[j]) > 100.0f / 32768.0f) {
+                clippedLen = (int)(j + 1);
+            }
+        }
+        if (clippedLen > 0 && clippedLen < (int)h->irLayers[l].data.size()) {
+            h->irLayers[l].data.resize(clippedLen);
+            LOGI("IR layer %d clipped to %d samples (engine-sim style)", l, clippedLen);
         }
     }
     LOGI("Loaded %d IR layers", h->activeIrCount);
