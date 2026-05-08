@@ -3,6 +3,7 @@
 #include <android/log.h>
 #include <android/asset_manager.h>
 #include <android/asset_manager_jni.h>
+#include <chrono>
 #include <cstring>
 #include <memory>
 #include <cmath>
@@ -44,6 +45,9 @@ struct EngineSimHandle {
     float currentThrottle = 0.0f;
     float volume = 1.0f;
     bool isRunning = false;
+    bool isStarting = false;     // 스타터 모터 크랭킹 중
+    double starterStartTime = 0; // 크랭킹 시작 시각 (seconds)
+    double starterDuration = 2.0;// 크랭킹 지속 시간
     int sampleRate = 44100;
     int cylinderCount = 4;
 
@@ -153,6 +157,9 @@ static void audioPump(EngineSimHandle* h) {
     int jitterWritePos = 0;
     int writeCount = 0;
 
+    // Time tracking for starter
+    auto startTime = std::chrono::steady_clock::now();
+
     double crankAngle = 0.0;
     const double cycleRad = 4.0 * M_PI;  // 720 degrees
 
@@ -180,7 +187,34 @@ static void audioPump(EngineSimHandle* h) {
     };
 
     while (h->audioPumpRunning.load()) {
-        if (h->isRunning && h->audioEngine && h->audioEngine->isActive()) {
+        // === Starter motor simulation ===
+        if (h->isStarting && !h->isRunning) {
+            auto now = std::chrono::steady_clock::now();
+            double currentTime = std::chrono::duration<double>(now - startTime).count();
+            
+            // Record start time on first frame
+            if (h->starterStartTime == 0) h->starterStartTime = currentTime;
+            double elapsed = currentTime - h->starterStartTime;
+            if (elapsed < 0) elapsed = 0;
+            double progress = elapsed / h->starterDuration;
+            
+            if (progress >= 1.0) {
+                // 시동 성공! 엔진 점화
+                h->isStarting = false;
+                h->isRunning = true;
+                h->currentRpm = 1200.0f; // 높은 아이들로 점프
+                LOGI("Engine started!");
+            } else {
+                // 크랭킹: 150~350 RPM 불규칙하게
+                double baseCrankRpm = 150.0 + progress * 200.0;
+                // 랜덤한 RPM 변동 (실린더 압축 저항)
+                double crankVariation = 80.0 * std::sin(elapsed * 37.0) + 40.0 * std::sin(elapsed * 73.0);
+                h->currentRpm = (float)(baseCrankRpm + crankVariation);
+                if (h->currentRpm < 80.0f) h->currentRpm = 80.0f;
+            }
+        }
+        
+        if ((h->isRunning || h->isStarting) && h->audioEngine && h->audioEngine->isActive()) {
             double sr = h->sampleRate;
 
             for (int i = 0; i < chunkSize; i++) {
@@ -207,6 +241,10 @@ static void audioPump(EngineSimHandle* h) {
                 // === 1. Generate exhaust flow (physical model) ===
                 float exhaustFlow = 0.0f;
                 float throttle = (float)smoothThrottle;
+                // Ensure minimum throttle for exhaust pulse generation (cranking + idle)
+                if (throttle < 0.1f) {
+                    throttle = 0.1f;
+                }
 
                 for (int c = 0; c < h->cylinderCount; c++) {
                     double cylOffset = (720.0 / h->cylinderCount) * c;
@@ -218,7 +256,7 @@ static void audioPump(EngineSimHandle* h) {
                     // Exhaust valve open: ~130° to ~400° in 720° cycle
                     if (cylDeg > 130.0 && cylDeg < 400.0) {
                         double t = (cylDeg - 130.0) / 270.0;
-                        exhaustFlow += (float)(std::exp(-t * 3.0) * smoothThrottle);
+                        exhaustFlow += (float)(std::exp(-t * 3.0) * throttle);
                     }
                 }
 
@@ -410,13 +448,19 @@ static void audioPump(EngineSimHandle* h) {
                 prevAntiAlias = antiAliased;
 
                 // === 10. Leveling filter (engine-sim peak-tracking AGC) ===
-                levelPeak = 0.999f * levelPeak;
-                if (std::abs(antiAliased) > levelPeak) levelPeak = std::abs(antiAliased);
-                if (levelPeak > 0.001f) {
-                    float levelAtten = levelTarget / levelPeak;
-                    if (levelAtten < 0.00001f) levelAtten = 0.00001f;
-                    else if (levelAtten > 1.9f) levelAtten = 1.9f;
-                    levelAttenuation = 0.9f * levelAttenuation + 0.1f * levelAtten;
+                // During cranking: bypass leveling (signal too weak, AGC kills it)
+                if (h->isStarting && !h->isRunning) {
+                    levelAttenuation = 1.0f;
+                    levelPeak = 0.001f;
+                } else {
+                    levelPeak = 0.999f * levelPeak;
+                    if (std::abs(antiAliased) > levelPeak) levelPeak = std::abs(antiAliased);
+                    if (levelPeak > 0.001f) {
+                        float levelAtten = levelTarget / levelPeak;
+                        if (levelAtten < 0.00001f) levelAtten = 0.00001f;
+                        else if (levelAtten > 1.9f) levelAtten = 1.9f;
+                        levelAttenuation = 0.9f * levelAttenuation + 0.1f * levelAtten;
+                    }
                 }
                 float output = antiAliased * levelAttenuation * h->volume;
 
@@ -499,8 +543,11 @@ Java_com_enginesim_app_EngineSimLibrary_nativeStart(JNIEnv* env, jobject thiz, j
     if (handle == 0) return;
 
     EngineSimHandle* h = reinterpret_cast<EngineSimHandle*>(handle);
-    h->isRunning = true;
-    LOGI("Engine started, isRunning=%d", h->isRunning);
+    h->isStarting = true;
+    h->isRunning = false;
+    h->starterStartTime = 0; // Will be set on first audioPump iteration
+    h->currentRpm = 0.0f;
+    LOGI("Engine cranking started");
 }
 
 JNIEXPORT void JNICALL
@@ -509,7 +556,8 @@ Java_com_enginesim_app_EngineSimLibrary_nativeStop(JNIEnv* env, jobject thiz, jl
 
     EngineSimHandle* h = reinterpret_cast<EngineSimHandle*>(handle);
     h->isRunning = false;
-    h->currentRpm = 800.0f;
+    h->isStarting = false;
+    h->currentRpm = 0.0f;
     h->currentThrottle = 0.0f;
     LOGI("Engine stopped");
 }
