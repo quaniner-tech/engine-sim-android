@@ -121,9 +121,11 @@ jobs:
       - name: Create local.properties
         run: echo "sdk.dir=/home/runner/Android/Sdk" > android/local.properties
 
+      # ВОТ ЗДЕСЬ МЫ ПРИНУДИТЕЛЬНО ОБНОВЛЯЕМ GRADLE ДО 8.5
       - name: Build Android APK
         run: |
           cd android
+          ./gradlew wrapper --gradle-version=8.5
           ./gradlew assembleDebug --no-daemon -q
 
       - name: Run Android Unit Tests
