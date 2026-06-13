@@ -8,7 +8,7 @@ on:
   workflow_dispatch:
 
 env:
-  NDK_VERSION: r26b
+  NDK_VERSION: 25.2.9519653
   CMAKE_VERSION: 3.22.1
 
 jobs:
@@ -110,7 +110,7 @@ jobs:
           rm cmdline-tools.zip
 
           yes | ~/Android/Sdk/cmdline-tools/latest/bin/sdkmanager --sdk_root=~/Android/Sdk \
-            "platforms;android-34" "build-tools;34.0.0" "ndk;26b"
+            "platforms;android-34" "build-tools;34.0.0" "ndk;25.2.9519653"
 
       - name: Setup ANDROID_HOME
         run: echo "ANDROID_HOME=~/Android/Sdk" >> $GITHUB_ENV
@@ -118,7 +118,6 @@ jobs:
       - name: Grant execute permission for gradlew
         run: chmod +x android/gradlew
 
-      # ВОТ ЭТОТ БЛОК ДОБАВЛЕН ДЛЯ СОЗДАНИЯ local.properties
       - name: Create local.properties
         run: echo "sdk.dir=/home/runner/Android/Sdk" > android/local.properties
 
@@ -139,7 +138,6 @@ jobs:
           name: android-test-reports
           path: android/app/build/reports/tests/
 
-      # ВОТ ЭТОТ БЛОК ДОБАВЛЕН ДЛЯ СОХРАНЕНИЯ APK
       - name: Upload Debug APK
         if: always()
         uses: actions/upload-artifact@v4
