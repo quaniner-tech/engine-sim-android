@@ -5,6 +5,7 @@ on:
     branches: [main, develop]
   pull_request:
     branches: [main, develop]
+  workflow_dispatch: # Добавил возможность ручного запуска
 
 env:
   NDK_VERSION: r26b
@@ -46,8 +47,7 @@ jobs:
 
       - name: Configure CMake
         run: |
-          mkdir -p android/app/src/test/cpp/build
-          cd android/app/src/test/cpp/build
+          mkdir -p android/app/src/test/cpp/build          cd android/app/src/test/cpp/build
           cmake .. \
             -DCMAKE_BUILD_TYPE=Debug \
             -DCMAKE_TOOLCHAIN_FILE=$ANDROID_SDK_ROOT/ndk/$NDK_VERSION/build/cmake/android.toolchain.cmake \
@@ -70,7 +70,6 @@ jobs:
   android-tests:
     name: Android Tests (Unit + Instrumented)
     runs-on: macos-latest
-    # Alternative: use ubuntu with emulator for instrumented tests
 
     steps:
       - name: Checkout
@@ -97,8 +96,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: |
-            ~/Android/Sdk
-            ~/.android
+            ~/Android/Sdk            ~/.android
           key: android-sdk-${{ runner.os }}
 
       - name: Setup Android SDK
@@ -130,18 +128,17 @@ jobs:
           cd android
           ./gradlew testDebugUnitTest --no-daemon
 
-      - name: Run Android Instrumented Tests (with emulator)
-        # Note: Requires emulator to be available. In CI, we start one.
-        run: |
-          cd android
-          # Start emulator in background (requires adequate CI environment)
-          # For now, we rely on unit tests passing
-          # Full instrumented test run requires emulator setup
-          echo "Instrumented tests require emulator - checking unit test results"
-
       - name: Upload test reports
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: android-test-reports
           path: android/app/build/reports/tests/
+
+      # ВОТ ЭТОТ БЛОК Я ДОБАВИЛ ↓↓↓
+      - name: Upload Debug APK
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: engine-sim-debug-apk
+          path: android/app/build/outputs/apk/debug/app-debug.apk
