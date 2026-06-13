@@ -5,7 +5,7 @@ on:
     branches: [main, develop]
   pull_request:
     branches: [main, develop]
-  workflow_dispatch: # Добавил возможность ручного запуска
+  workflow_dispatch:
 
 env:
   NDK_VERSION: r26b
@@ -118,6 +118,10 @@ jobs:
       - name: Grant execute permission for gradlew
         run: chmod +x android/gradlew
 
+      # ВОТ ЭТОТ БЛОК ДОБАВЛЕН ДЛЯ СОЗДАНИЯ local.properties
+      - name: Create local.properties
+        run: echo "sdk.dir=/home/runner/Android/Sdk" > android/local.properties
+
       - name: Build Android APK
         run: |
           cd android
@@ -135,7 +139,7 @@ jobs:
           name: android-test-reports
           path: android/app/build/reports/tests/
 
-      # ВОТ ЭТОТ БЛОК Я ДОБАВИЛ ↓↓↓
+      # ВОТ ЭТОТ БЛОК ДОБАВЛЕН ДЛЯ СОХРАНЕНИЯ APK
       - name: Upload Debug APK
         if: always()
         uses: actions/upload-artifact@v4
